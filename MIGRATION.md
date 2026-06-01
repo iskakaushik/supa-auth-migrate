@@ -1,100 +1,102 @@
 # Migrating data off Supabase → ClickHouse‑managed Postgres (Auth stays on Supabase)
 
 This guide moves your **application data** (the Postgres `public` schema) out of Supabase
-into a **ClickHouse‑managed Postgres** instance using `pg_dump` / `pg_restore`, while
-**Supabase Auth keeps running on Supabase**. It is written for existing Supabase users
-who rely on Supabase Auth (email/password, OAuth, RLS).
+into a **ClickHouse‑managed Postgres** using `pg_dump` / `pg_restore`, while **Supabase Auth
+keeps running on Supabase**.
 
-It uses this repo's TODO app (`public.todos`) as a fully worked, tested example. Every
-command below was run against a real Supabase project (Postgres 17.6) and a real
-ClickHouse Cloud Postgres target (Postgres 18.4).
+The **data migration is the same for everyone**. How much **app rewiring** you do depends on
+two things about your app today: **do you use PostgREST**, and **do you use RLS**. Find your
+bucket below, do **Part 1** (shared), then jump to your bucket in **Part 2**.
 
----
-
-## TL;DR
-
-```bash
-PG=/path/to/postgresql-18/bin   # your Postgres 18 client tools (pg_dump, psql)
-
-# 1. Dump SCHEMA of the public schema and SEE what won't restore on plain Postgres
-"$PG/pg_dump" "$SUPABASE_DB_URL" --schema-only --schema=public -f schema.sql
-
-# 2. Hand off the auth coupling: write a *decoupled* schema (no FK to auth.users,
-#    no RLS, no anon/authenticated/service_role grants) — see §4.
-
-# 3. Dump DATA only
-"$PG/pg_dump" "$SUPABASE_DB_URL" --data-only --schema=public --no-owner --no-privileges -f data.sql
-
-# 4. Restore into the target
-"$PG/psql" "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -f decoupled_schema.sql
-"$PG/psql" "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -f data.sql
-
-# 5. Verify row counts match, then rewire the app (§8): data via a direct
-#    Postgres driver, auth still via Supabase, RLS replaced by app-level checks.
-```
-
-> ⚠️ The single biggest thing to understand: **on a plain Postgres there is no
-> PostgREST, no Row Level Security context, no `auth.uid()`, and no `anon` /
-> `authenticated` / `service_role` roles.** Your data restores fine, but the
-> *authorization* that Supabase did for you is gone and must move into your app.
+Every command here was run against a real Supabase source (Postgres 17.6) and a real
+ClickHouse‑managed Postgres target (Postgres 18.4); the worked example migrates a
+`public.todos` table with 3 rows and verifies it.
 
 ---
 
-## 0. The mental model (read this first)
+## Find your bucket (start here)
+
+Answer two questions about how your app works **today**.
+
+**1. How does your app read & write data?**
+- **PostgREST** — through `supabase-js` (`supabase.from('todos')…`, `supabase.rpc(...)`) or
+  HTTP calls to `https://<project-ref>.supabase.co/rest/v1/…`. *(This is the Supabase default.)*
+- **Direct Postgres** — your code already opens a Postgres connection itself: a connection
+  string with a driver (`pg`, `postgres`), an ORM (Prisma, Drizzle), or a backend pool.
+
+**2. How is per‑user data access enforced?**
+- **RLS** — Row Level Security policies on your tables (typically `using (auth.uid() = user_id)`);
+  the database filters rows per user.
+- **No RLS** — you authorize in application code (or via Edge Functions / a service role); the
+  database itself does not enforce per‑user access.
+
+|                     | **RLS**                          | **No RLS**                        |
+| ------------------- | -------------------------------- | --------------------------------- |
+| **PostgREST**       | 🟥 **[Bucket A](#bucket-a)** — most work | 🟧 **[Bucket B](#bucket-b)**      |
+| **Direct Postgres** | 🟨 **[Bucket C](#bucket-c)**     | 🟩 **[Bucket D](#bucket-d)** — least work |
+
+- **[Bucket A — PostgREST + RLS](#bucket-a)** *(this repo's example)* — replace PostgREST with a
+  Postgres driver **and** reimplement RLS as app‑level checks.
+- **[Bucket B — PostgREST + No RLS](#bucket-b)** — replace PostgREST with a driver; your
+  authorization already lives in app code.
+- **[Bucket C — Direct + RLS](#bucket-c)** — keep your driver, swap the connection, and move the
+  RLS rules into your queries.
+- **[Bucket D — Direct + No RLS](#bucket-d)** — essentially just change the connection string.
+
+> **What everyone loses on a plain Postgres:** there is no PostgREST API, no RLS *context*
+> (`auth.uid()`), no `anon` / `authenticated` / `service_role` roles, and no `auth` schema.
+> Your **data** restores fine; the **authorization** Supabase did for you must move to where
+> your bucket says.
+
+Then: do **[Part 1 — Data migration](#part-1)** (all buckets) → **[Part 2 — App rewiring](#part-2)** (your bucket).
+
+---
+
+## 0. Mental model
 
 ### Before (Supabase)
 
 ```
-Browser ──(supabase-js)──> PostgREST ──> Postgres (public.*)
-                              │              ├─ RLS policies using auth.uid()
-   Supabase Auth (JWT) ───────┘              └─ FK public.todos.user_id → auth.users.id
+                          ┌─ (PostgREST users) ─ supabase-js ─► PostgREST ─┐
+Browser / your server ────┤                                                ├─► Supabase Postgres (public.*)
+                          └─ (Direct users) ──── pg / ORM ─────────────────┘     ├─ RLS policies via auth.uid()
+                                                                                  └─ FK user_id → auth.users.id
+   Supabase Auth issues the JWT ──────────────────────────────────────────────────────────────────────────┘
 ```
-
-The browser talks to **PostgREST** with the user's JWT. Postgres reads `auth.uid()`
-from that JWT and **RLS** filters rows to the current user automatically. The `auth`
-schema (users, sessions) lives in the same database.
 
 ### After (this migration)
 
 ```
-Browser ──> Your Next.js server ──(pg driver)──> ClickHouse-managed Postgres (public.*)
-                │                                   └─ plain tables, NO RLS, NO auth schema
-                └──(supabase-js)──> Supabase Auth (still issues & validates the JWT)
+Browser ─► your server ─── pg driver ──► ClickHouse-managed Postgres (public.*)   [plain tables: no PostgREST, no RLS, no auth schema]
+                │
+                └── supabase-js ─► Supabase Auth   [still issues & validates the user's JWT]
 ```
 
-- **Data** lives on the new Postgres. There is **no PostgREST and no RLS** there.
-- **Auth** still lives on Supabase. Your app still calls `supabase.auth.*` to log users
-  in and to read the current user/session on the server.
-- **Your server becomes the trust boundary.** It authenticates the user with Supabase
-  (`supabase.auth.getUser()`), then runs SQL against the new Postgres **with an explicit
-  `where user_id = <the authenticated user's id>`** on every query. The database no
-  longer enforces per-user access — your code does.
-
-### What Supabase gave you that a plain Postgres does not
-
-| Supabase feature | On plain Postgres | What you do instead |
-|---|---|---|
-| PostgREST auto-API (`supabase.from('todos')`) | ❌ none | Connect with a Postgres driver (`pg`, `postgres`, Drizzle, Prisma) |
-| RLS + `auth.uid()` | ❌ `auth.uid()` doesn't exist | Filter by `user_id` in every query (app-level authz) |
-| Roles `anon`, `authenticated`, `service_role` | ❌ don't exist | One app DB user; authorize in code |
-| `auth` schema / `auth.users` | ❌ stays on Supabase | Drop the FK; `user_id` is just a UUID that still matches Supabase user IDs |
+- **Data** lives on the new Postgres. **Auth** stays on Supabase.
+- **Your server is the trust boundary:** it authenticates the user with Supabase
+  (`supabase.auth.getUser()`), then runs SQL with the connection credential and authorizes in
+  code. The database no longer knows about users.
 
 ---
 
-## 1. Prerequisites
+<a id="part-1"></a>
+
+# Part 1 — Data migration (all buckets)
+
+## 1.1 Prerequisites
 
 - **Postgres 18 client tools** (`pg_dump`, `psql`, `pg_restore`). Point `PG` at your install:
   ```bash
   PG=/path/to/postgresql-18/bin   # e.g. a Homebrew libpq 18 bin dir
   "$PG/pg_dump" --version    # pg_dump (PostgreSQL) 18.4
   ```
-  Use a client **≥ the source server version**. Source here is PG 17.6, target is PG 18.4,
-  so the 18.4 client dumps the 17.6 source and restores into the 18.4 target — correct direction.
+  Use a client **≥ the source server version** (source PG 17.6, target PG 18.4 here → the 18.4
+  client dumps 17.6 and restores into 18.4, the correct direction).
 
-- **Two connection strings.** Set these as environment variables in your shell (e.g. in a
-  local, untracked file you `source`). **Never hardcode passwords or commit them.** To keep
-  the password out of your shell history / process list, prefer a `~/.pgpass` file or export
-  `PGPASSWORD` separately instead of inlining it in the URL.
+- **Two connection strings.** Set them as environment variables in your shell (e.g. a local,
+  untracked file you `source`). **Never hardcode passwords or commit them.** To keep the
+  password out of shell history / process lists, prefer a `~/.pgpass` file or a separately
+  exported `PGPASSWORD` rather than inlining it in the URL.
 
   **Source (Supabase) — use the SESSION POOLER on port `5432`:**
   ```bash
@@ -102,44 +104,38 @@ Browser ──> Your Next.js server ──(pg driver)──> ClickHouse-managed 
   export SUPABASE_DB_URL="postgresql://postgres.<PROJECT_REF>:<DB_PASSWORD>@aws-0-<REGION>.pooler.supabase.com:5432/postgres"
   ```
   - ✅ Port **5432** = session mode → works with `pg_dump`.
-  - ❌ Port **6543** = transaction mode → **`pg_dump` will fail** (no session-level features).
-  - The direct host `db.<PROJECT_REF>.supabase.co` is **IPv6-only** on Supabase; the pooler is
-    the reliable IPv4 path. Copy your exact pooler host from the dashboard's **Connect** dialog.
+  - ❌ Port **6543** = transaction mode → **`pg_dump` will fail** (no session features).
+  - The direct host `db.<PROJECT_REF>.supabase.co` is **IPv6-only**; the pooler is the reliable
+    IPv4 path. Copy your exact pooler host from the **Connect** dialog.
 
   **Target (ClickHouse-managed Postgres):**
   ```bash
   export TARGET_DB_URL="postgresql://<USER>:<PASSWORD>@<TARGET_HOST>:5432/<DB>?sslmode=require"
   ```
-  Managed Postgres requires TLS — keep `sslmode=require` in the URL (or `?sslmode=require`).
+  Managed Postgres requires TLS — keep `?sslmode=require`.
 
----
+## 1.2 Decide what moves
 
-## 2. Decide what moves
-
-Migrate **only your `public` schema** (your application tables). Do **not** dump Supabase's
-internal schemas — they belong to the Supabase platform and have no meaning on a plain Postgres:
+Migrate **only your `public` schema** (your app tables). Do **not** dump Supabase's internal
+schemas — they belong to the platform and mean nothing on a plain Postgres:
 
 > `auth`, `storage`, `realtime`, `vault`, `graphql`, `graphql_public`,
 > `supabase_functions`, `supabase_migrations`, `extensions`, `pgbouncer`, `net`.
 
-List your own tables first:
-
 ```bash
-"$PG/psql" "$SUPABASE_DB_URL" -c "\dt public.*"
+"$PG/psql" "$SUPABASE_DB_URL" -c "\dt public.*"     # list your tables
 ```
 
-For this app that's a single table: `public.todos`.
+For this app that's one table: `public.todos`.
 
----
-
-## 3. Dump the schema and see what won't restore
+## 1.3 Dump the schema and see what won't restore
 
 ```bash
 "$PG/pg_dump" "$SUPABASE_DB_URL" --schema-only --schema=public --no-comments -f schema.sql
 ```
 
-Here is exactly what Supabase emits for `public.todos` (trimmed), with every line that
-**breaks on a plain Postgres** flagged:
+What Supabase emits for `public.todos` (trimmed), with the lines that **break on a plain
+Postgres** flagged:
 
 ```sql
 CREATE TABLE public.todos (
@@ -151,13 +147,12 @@ CREATE TABLE public.todos (
 );
 
 ALTER TABLE public.todos OWNER TO postgres;                     -- ⚠️ role may not exist on target
-ALTER TABLE ONLY public.todos ADD CONSTRAINT todos_pkey PRIMARY KEY (id);
 
 -- ⚠️ FK into the auth schema — auth.users does NOT exist on the target
 ALTER TABLE ONLY public.todos
     ADD CONSTRAINT todos_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
 
--- ⚠️ RLS policies call auth.uid() — that function does NOT exist on the target
+-- ⚠️ RLS policies call auth.uid() — that function does NOT exist on the target  (RLS buckets only)
 CREATE POLICY "select own todos" ON public.todos FOR SELECT USING ((auth.uid() = user_id));
 CREATE POLICY "insert own todos" ON public.todos FOR INSERT WITH CHECK ((auth.uid() = user_id));
 CREATE POLICY "delete own todos" ON public.todos FOR DELETE USING ((auth.uid() = user_id));
@@ -167,37 +162,27 @@ ALTER TABLE public.todos ENABLE ROW LEVEL SECURITY;
 GRANT ALL ON TABLE public.todos TO anon;
 GRANT ALL ON TABLE public.todos TO authenticated;
 GRANT ALL ON TABLE public.todos TO service_role;
--- (plus many ALTER DEFAULT PRIVILEGES ... TO anon/authenticated/service_role lines)
+-- (plus ALTER DEFAULT PRIVILEGES ... TO anon/authenticated/service_role)
 ```
 
-If you tried to restore this verbatim into a plain Postgres you'd get:
+Restoring this verbatim fails with `schema "auth" does not exist`,
+`function auth.uid() does not exist`, `role "anon"/"authenticated"/"service_role" does not exist`.
 
-```
-ERROR:  schema "auth" does not exist
-ERROR:  function auth.uid() does not exist
-ERROR:  role "anon" does not exist
-ERROR:  role "authenticated" does not exist
-ERROR:  role "service_role" does not exist
-```
+## 1.4 Strip the Supabase coupling (the decoupled schema)
 
-That's expected — those objects are Supabase-specific. Next we strip them.
+Remove the platform-specific bits. **All buckets** remove:
 
----
-
-## 4. Strip the auth coupling (the decoupled schema)
-
-Because **auth stays on Supabase**, the target table should be a plain table. Remove:
-
-- [x] `OWNER TO postgres` and all `GRANT ... TO anon/authenticated/service_role`
+- [x] `OWNER TO postgres` and every `GRANT ... TO anon/authenticated/service_role`
 - [x] `ALTER DEFAULT PRIVILEGES ... TO anon/authenticated/service_role`
-- [x] the `FOREIGN KEY (user_id) REFERENCES auth.users(id)` constraint
-- [x] `ENABLE ROW LEVEL SECURITY` and all `CREATE POLICY ...`
+- [x] any `FOREIGN KEY (user_id) REFERENCES auth.users(id)` (auth lives on Supabase now)
 
-Keep:
+**RLS buckets (A & C) also remove** *(No‑RLS buckets won't have these in the dump)*:
 
-- [x] the columns, the primary key, and your real CHECK/UNIQUE constraints
-- [x] `user_id uuid NOT NULL` — it still holds the **Supabase auth user ID**, it just isn't
-      a foreign key anymore. Add an index since you'll filter by it constantly.
+- [x] `ENABLE ROW LEVEL SECURITY` and every `CREATE POLICY ...`
+
+Keep: your columns, primary key, real CHECK/UNIQUE constraints, and `user_id uuid` — it still
+holds the Supabase auth user ID, it's just no longer a foreign key. Add an index since you'll
+filter on it constantly.
 
 `decoupled_schema.sql` (validated against the target):
 
@@ -212,27 +197,20 @@ create table if not exists public.todos (
 create index if not exists todos_user_id_idx on public.todos (user_id);
 ```
 
-> `gen_random_uuid()` is built into Postgres core since v13, so it works on the PG 18
-> target with no extension. If your tables use `uuid_generate_v4()` (uuid-ossp),
-> `crypt()`/`digest()` (pgcrypto), PostGIS, etc., `CREATE EXTENSION` those on the target first.
+> `gen_random_uuid()` is built into Postgres core since v13, so no extension is needed on PG 18.
+> If you use `uuid_generate_v4()` (uuid-ossp), `pgcrypto`, PostGIS, etc., `CREATE EXTENSION`
+> those on the target first.
+>
+> **Many tables?** Either dump with `--no-owner --no-privileges` (drops ownership/grants), then
+> delete the `auth`/RLS lines with a script, or keep a hand-maintained DDL per table.
 
-> **Tip for many tables:** generating the decoupled schema by hand doesn't scale. Either
-> (a) dump with `--no-owner --no-privileges` to drop ownership/grants, then delete the
-> `auth`/RLS lines with an editor or a small script, or (b) keep a hand-maintained DDL
-> per table (clearer, recommended for a stable schema like this one).
-
----
-
-## 5. Dump the data
+## 1.5 Dump the data
 
 ```bash
 "$PG/pg_dump" "$SUPABASE_DB_URL" \
-  --data-only --schema=public --no-owner --no-privileges \
-  -f data.sql
-# For a single table:  add  --table=public.todos
+  --data-only --schema=public --no-owner --no-privileges -f data.sql
+# single table:  add  --table=public.todos
 ```
-
-The dump is plain `COPY` data:
 
 ```sql
 COPY public.todos (id, user_id, task, inserted_at) FROM stdin;
@@ -242,25 +220,19 @@ COPY public.todos (id, user_id, task, inserted_at) FROM stdin;
 \.
 ```
 
-Notes:
-- `pg_dump` connects as the `postgres` role (the table owner), which **bypasses RLS**, so
-  you get *all* rows, not just one user's. Good — that's what you want for a full copy.
-- Postgres 18's `pg_dump` wraps the file in `\restrict … / \unrestrict …` (a `psql`
-  injection-safety guard). It's harmless and handled automatically when you restore with a
-  Postgres 18 `psql`.
-- The `user_id` values are the Supabase auth user UUIDs. They stay valid because auth still
-  lives on Supabase — you're just not enforcing the FK anymore.
+- `pg_dump` connects as the table owner, which **bypasses RLS** → you get all rows. Good.
+- PG 18's `pg_dump` wraps the file in `\restrict … / \unrestrict …` (a `psql` safety guard);
+  harmless and handled automatically by a PG 18 `psql`.
+- `user_id` values are the Supabase auth user UUIDs; they stay valid because auth stays on Supabase.
 
----
-
-## 6. Restore into the target
+## 1.6 Restore into the target & verify
 
 ```bash
 "$PG/psql" "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -f decoupled_schema.sql
 "$PG/psql" "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -f data.sql
 ```
 
-Worked-example output (real run against the ClickHouse Cloud PG 18.4 target):
+Real worked-example output:
 
 ```
 CREATE TABLE
@@ -272,52 +244,37 @@ SET
 COPY 3
 ```
 
-`-v ON_ERROR_STOP=1` makes `psql` exit non-zero on the first error instead of plowing
-ahead — always use it for restores.
-
----
-
-## 7. Verify
+Verify counts match (worked example: both return `3`):
 
 ```bash
-# source
 "$PG/psql" "$SUPABASE_DB_URL" -tAc "select count(*) from public.todos;"
-# target
 "$PG/psql" "$TARGET_DB_URL"   -tAc "select count(*) from public.todos;"
 ```
 
-Worked example: both return `3`, and the target rows are `test 1`, `test 2`, `test 3`. ✅
-For bigger tables also spot-check a few rows and compare `min/max(inserted_at)`.
+Data is migrated. Now rewire the app — **jump to your bucket**.
 
 ---
 
-## 8. Rewire the app (data → new Postgres, auth → still Supabase)
+<a id="part-2"></a>
 
-The data move is done; now the app must read/write the new Postgres directly and **re-implement
-the authorization RLS used to do.** Auth — login, sessions, the GitHub OAuth flow, the
-middleware/`proxy.ts` session refresh, `lib/supabase/{client,server}.ts` — **does not change.**
+# Part 2 — App rewiring (pick your bucket)
 
-### 8.1 Install a Postgres driver
+In every bucket, **auth stays on Supabase**: keep using `supabase-js` for login/sessions and
+read the user server-side with `supabase.auth.getUser()` (it verifies the JWT — don't use
+`getSession()` for authorization). What changes is the **data path**.
 
+The two building blocks the buckets reuse:
+
+**Install a Postgres driver** (skip if you already have one — Buckets C/D):
 ```bash
 npm install pg
 npm install -D @types/pg
 ```
 
-### 8.2 Add the connection string (server-only secret)
-
-`.env.local` — note it is **not** prefixed `NEXT_PUBLIC_`, so it never reaches the browser:
-
-```bash
-DATABASE_URL=postgresql://<USER>:<PASSWORD>@<TARGET_HOST>:5432/<DB>?sslmode=require
-```
-
-### 8.3 `lib/db.ts` — a pooled client
-
+**`lib/db.ts` — a pooled client**:
 ```ts
 import { Pool } from "pg";
 
-// One pool per server process. DATABASE_URL points at the ClickHouse-managed Postgres.
 declare global {
   // eslint-disable-next-line no-var
   var _pgPool: Pool | undefined;
@@ -326,29 +283,29 @@ declare global {
 export const db =
   global._pgPool ??
   new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }, // managed PG terminates TLS; relax verification or pass the CA
+    connectionString: process.env.DATABASE_URL, // the new Postgres (server-only secret)
+    ssl: { rejectUnauthorized: false },          // managed PG terminates TLS
     max: 5,
   });
 
 if (process.env.NODE_ENV !== "production") global._pgPool = db;
 ```
 
-### 8.4 Auth is unchanged — keep reading the user from Supabase
-
-```ts
-const supabase = await createClient();                 // lib/supabase/server.ts — UNCHANGED
-const { data: { user } } = await supabase.auth.getUser();
-if (!user) redirect("/login");
+`.env.local` (never committed; not `NEXT_PUBLIC_`, so it never reaches the browser):
+```bash
+DATABASE_URL=postgresql://<USER>:<PASSWORD>@<TARGET_HOST>:5432/<DB>?sslmode=require
 ```
 
-Always use `getUser()` (it verifies the JWT with Supabase), **not** `getSession()`, for any
-decision that gates data access.
+---
 
-### 8.5 Replace PostgREST + RLS with explicit, user-scoped SQL
+<a id="bucket-a"></a>
+
+## 🟥 Bucket A — PostgREST + RLS  *(most work; this repo)*
+
+You call `supabase.from(...)` and rely on RLS for per‑user access. You must do **both**:
+swap PostgREST for the driver, **and** turn each RLS policy into an explicit query filter.
 
 **Listing — `app/page.tsx`**
-
 ```diff
 - const { data: todos } = await supabase
 -   .from("todos")
@@ -357,14 +314,13 @@ decision that gates data access.
 + const { rows: todos } = await db.query(
 +   `select id, task, inserted_at
 +      from public.todos
-+     where user_id = $1                 -- ← this WHERE replaces the RLS SELECT policy
++     where user_id = $1                 -- ← replaces the RLS SELECT policy
 +     order by inserted_at asc`,
 +   [user.id],
 + );
 ```
 
 **Add / delete — `app/actions.ts`**
-
 ```diff
   export async function addTodo(formData: FormData) {
     const task = String(formData.get("task") ?? "").trim();
@@ -375,7 +331,7 @@ decision that gates data access.
 -   await supabase.from("todos").insert({ task, user_id: user.id });
 +   await db.query(
 +     `insert into public.todos (user_id, task) values ($1, $2)`,
-+     [user.id, task],                   // ← app sets the owner; the INSERT policy is gone
++     [user.id, task],                   // app sets the owner; the INSERT policy is gone
 +   );
     revalidatePath("/");
   }
@@ -388,48 +344,109 @@ decision that gates data access.
 -   const supabase = await createClient();
 -   await supabase.from("todos").delete().eq("id", id);
 +   await db.query(
-+     `delete from public.todos where id = $1 and user_id = $2`,
-+     [id, user.id],                     // ← "and user_id = $2" replaces the DELETE policy
++     `delete from public.todos where id = $1 and user_id = $2`,  // "and user_id" = the DELETE policy
++     [id, user.id],
 +   );
     revalidatePath("/");
   }
 ```
 
-### 8.6 🔒 Security: RLS is gone — the WHERE clause IS your security boundary
+> 🔒 **RLS is gone — the `where user_id = …` clause IS your security boundary.** Every query
+> touching user data must filter by the authenticated user's id, and inserts must set `user_id`
+> from the session (never from client input). Use **parameterized queries** only. Consider a
+> thin data-access layer so no route can forget the filter.
 
-With RLS removed, the database will happily return or delete **any** row. Every single query
-that touches user data **must** include `where user_id = <authenticated user id>` (and inserts
-must set `user_id` from the session, never from client input). Use **parameterized queries**
-(`$1`, `$2`) exclusively — string-concatenated SQL is now a direct injection/IDOR risk that
-RLS used to backstop. Consider a thin data-access layer so no route can forget the filter.
-
-### 8.7 What changes vs. what stays
-
-| Keep (auth, unchanged) | Replace (data) |
-|---|---|
-| `lib/supabase/client.ts`, `server.ts` | `supabase.from('todos')…` → `db.query(...)` |
-| `proxy.ts` session refresh | RLS policies → `where user_id = $1` in code |
-| `/login`, GitHub OAuth, `/auth/callback` | `NEXT_PUBLIC_SUPABASE_*` stays for auth; add `DATABASE_URL` for data |
-| `supabase.auth.getUser()` | — |
+What stays unchanged: `lib/supabase/{client,server}.ts`, `proxy.ts`, `/login`, the GitHub OAuth
+flow, `/auth/callback`. Keep `NEXT_PUBLIC_SUPABASE_*` for auth; add `DATABASE_URL` for data.
 
 ---
 
-## 9. Cutover & rollback
+<a id="bucket-b"></a>
 
-- **This is a one-time snapshot.** `pg_dump`/`pg_restore` copies the data at a point in time.
-  To avoid losing writes, do the final dump during a short **maintenance window** (pause
-  writes / put the app in read-only), or re-run a delta for append-only tables filtered by
-  `inserted_at > <last cutover time>`.
-- **Cutover** = deploy the rewired app (§8) pointing `DATABASE_URL` at the new Postgres.
-- **Rollback is easy and safe:** the Supabase source is untouched by this process. To roll
-  back, redeploy the previous app version (still using `supabase.from(...)`). You can drop the
-  target table and re-run the migration as many times as you like.
-- **Out of scope (for now):** migrating Supabase Auth itself, and continuous replication/CDC
-  for zero-downtime. Auth intentionally stays on Supabase here.
+## 🟧 Bucket B — PostgREST + No RLS
+
+You call `supabase.from(...)`/`rpc(...)` but authorize in **app code** already (e.g. you call
+PostgREST server-side with the `service_role` key and filter in your handlers, or front
+everything with Edge Functions). One change: **stop using PostgREST, start using the driver.**
+
+1. Install `pg`, add `DATABASE_URL`, create `lib/db.ts` (above).
+2. Replace each `supabase.from('t').select/insert/update/delete(...)` and `supabase.rpc(...)`
+   call with the equivalent SQL via `db.query(...)`. Mechanically the same diffs as Bucket A.
+3. **Keep your existing authorization checks exactly as-is** — you already had them; RLS wasn't
+   doing the work. Just make sure each migrated query still carries whatever filter your code
+   relied on.
+4. Auth: keep Supabase `getUser()` server-side if you used Supabase Auth.
+
+> ⚠️ **Reality check:** "PostgREST + no RLS" on Supabase often means tables were reachable with
+> the anon/publishable key **with no DB-side protection**. If your only safeguard was that
+> nobody knew the URL — or you didn't actually filter server-side — your data was effectively
+> public. Treat yourself as **Bucket A** and add explicit `where user_id = …` filtering now.
 
 ---
 
-## 10. Gotchas quick reference
+<a id="bucket-c"></a>
+
+## 🟨 Bucket C — Direct Postgres + RLS
+
+You already open a Postgres connection (driver/ORM), but you rely on RLS — typically by
+connecting as the `authenticated` role and setting the request's JWT claims per query so
+`auth.uid()` resolves. On the new Postgres those roles and `auth.uid()` don't exist.
+
+1. **Swap the connection** to the new Postgres (`DATABASE_URL` / your ORM datasource). Add
+   `sslmode=require`.
+2. **Delete the per-request RLS setup.** Anything like the following must go — it has nothing to
+   bind to anymore:
+   ```sql
+   -- REMOVE: this only worked because Supabase injected an auth context
+   set local role authenticated;
+   set local request.jwt.claims = '{"sub":"<user-id>", ...}';
+   ```
+3. **Move the policy logic into your queries.** The policies you dropped in Part 1 become
+   explicit predicates:
+   ```diff
+   - -- previously enforced by RLS:  using (auth.uid() = user_id)
+   - select id, task from public.todos;                 -- RLS filtered it for you
+   + select id, task from public.todos where user_id = $1;   -- you filter now
+   ```
+4. Auth: get the user from Supabase server-side (`getUser()`), or if you verify tokens yourself,
+   validate the Supabase JWT against the project's JWKS, then pass that `sub`/user id into the
+   `where` clause.
+
+> 🔒 Same boundary as Bucket A: with RLS removed, **your WHERE clauses are the enforcement.**
+> Your connection/driver layer barely changes; your authorization moves up into the queries.
+
+---
+
+<a id="bucket-d"></a>
+
+## 🟩 Bucket D — Direct Postgres + No RLS  *(least work)*
+
+You already connect directly **and** authorize in app code. There's almost nothing to rewire.
+
+1. Run **Part 1** (dump → restore). With no RLS there are no policies to strip — just drop
+   ownership, the `anon/authenticated/service_role` grants, and any `auth.users` FK.
+2. **Point your connection string at the new Postgres** (`DATABASE_URL`, `sslmode=require`).
+3. That's it — your queries and authorization are unchanged.
+
+Sanity-check before cutover: confirm no query secretly depends on Supabase-only SQL
+(`auth.uid()`, `auth.*`/`storage.*` tables, or extensions you haven't created on the target).
+
+---
+
+# Cutover & rollback (all buckets)
+
+- **One-time snapshot.** `pg_dump`/`pg_restore` copies a point in time. To avoid losing writes,
+  run the final dump during a short **maintenance window** (pause writes / read-only), or re-run
+  a delta for append-only tables filtered by `inserted_at > <last cutover time>`.
+- **Cutover** = deploy the rewired app pointing `DATABASE_URL` at the new Postgres.
+- **Rollback is safe:** the Supabase source is untouched. Redeploy the previous version (still
+  using Supabase for data) to revert; you can drop the target table and re-run anytime.
+- **Out of scope (for now):** migrating Supabase Auth itself, and continuous replication/CDC for
+  zero-downtime. Auth intentionally stays on Supabase here.
+
+---
+
+# Gotchas quick reference
 
 | Symptom / risk | Cause | Fix |
 |---|---|---|
@@ -437,11 +454,11 @@ RLS used to backstop. Consider a thin data-access layer so no route can forget t
 | `connection refused` to `db.<ref>.supabase.co` | Direct host is IPv6-only | Use the pooler hostname (IPv4) |
 | `server version mismatch` | `pg_dump` older than server | Use a client **≥** server version (PG 18 client here) |
 | `role "anon"/"authenticated"/"service_role" does not exist` | Grants in the dump | Strip grants / dump with `--no-owner --no-privileges` |
-| `schema "auth" does not exist` | FK to `auth.users` | Drop the FK (decoupled schema, §4) |
-| `function auth.uid() does not exist` | RLS policies | Drop RLS + policies; enforce in app (§8) |
-| `function gen_random_uuid() does not exist` | Missing extension (only < PG13) | Built-in on PG 18; otherwise `create extension pgcrypto` |
-| Rows leak across users after migration | RLS no longer enforced | Add `where user_id = $1` to **every** query (§8.6) |
-| TLS/`SSL required` on target | Managed PG mandates TLS | Keep `?sslmode=require` in `TARGET_DB_URL` |
+| `schema "auth" does not exist` | FK to `auth.users` | Drop the FK (§1.4) |
+| `function auth.uid() does not exist` | RLS policies (Buckets A/C) | Drop RLS + policies; enforce in app (Part 2) |
+| `function gen_random_uuid() does not exist` | Missing extension (only < PG13) | Built-in on PG 18; else `create extension pgcrypto` |
+| Rows leak across users after migration | RLS no longer enforced (Buckets A/C) | Add `where user_id = $1` to **every** query |
+| TLS/`SSL required` on target | Managed PG mandates TLS | Keep `?sslmode=require` in the URL |
 | Sequences out of sync (serial/identity) | `--data-only` doesn't bump sequences | `select setval('seq', (select max(id) from t));` after load (N/A for uuid keys) |
 | Huge tables slow | Single-stream COPY | Dump `-Fc` (custom) and restore with `pg_restore -j <N>` in parallel |
 
@@ -459,7 +476,7 @@ export TARGET_DB_URL="postgresql://<USER>:<PASSWORD>@<TARGET_HOST>:5432/<DB>?ssl
 "$PG/pg_dump" "$SUPABASE_DB_URL" --schema-only --schema=public --no-comments -f schema.sql
 "$PG/pg_dump" "$SUPABASE_DB_URL" --data-only --table=public.todos --no-owner --no-privileges -f data.sql
 
-# restore (decoupled_schema.sql is the §4 DDL)
+# restore (decoupled_schema.sql is the §1.4 DDL)
 "$PG/psql" "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -f decoupled_schema.sql
 "$PG/psql" "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -f data.sql
 
@@ -467,6 +484,6 @@ export TARGET_DB_URL="postgresql://<USER>:<PASSWORD>@<TARGET_HOST>:5432/<DB>?ssl
 "$PG/psql" "$TARGET_DB_URL" -tAc "select count(*) from public.todos;"   # → 3
 ```
 
-> This guide was validated against a Supabase source (Postgres 17.6) and a ClickHouse-managed
-> Postgres target (Postgres 18.4): a `public.todos` table with 3 rows migrated and verified.
-> Keep connection strings in environment variables or a secrets manager — never commit them.
+> Validated against a Supabase source (Postgres 17.6) and a ClickHouse‑managed Postgres target
+> (Postgres 18.4): `public.todos`, 3 rows, migrated and verified. Keep connection strings in
+> environment variables or a secrets manager — never commit them.

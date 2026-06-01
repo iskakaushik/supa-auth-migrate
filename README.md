@@ -58,3 +58,7 @@ the Supabase dashboard with its client id/secret.
 See **[MIGRATION.md](./MIGRATION.md)** — a tested, step-by-step guide for moving the
 `public` data to a ClickHouse‑managed Postgres via `pg_dump`/`pg_restore` while Supabase Auth
 stays put (stripping the `auth` coupling and moving authorization into the app layer).
+
+## License
+
+[Apache License 2.0](./LICENSE) © 2026 Kaushik Iska
