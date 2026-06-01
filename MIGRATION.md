@@ -44,10 +44,11 @@ Answer two questions about how your app works **today**.
   a `where user_id = ...` to each query.
 - **[Bucket D](#bucket-d)** (Direct + No RLS): change the connection string and you are done.
 
-> **What everyone loses on a plain Postgres:** there is no PostgREST API, no RLS *context*
-> (`auth.uid()`), no `anon` / `authenticated` / `service_role` roles, and no `auth` schema.
-> Your **data** restores fine; the **authorization** Supabase did for you moves to where your
-> bucket says (often just a `where` clause your app already has, or one short line per query).
+> **How this maps to a standard Postgres:** the target is plain, portable Postgres, so the
+> Supabase conveniences (the PostgREST API, the RLS *context* `auth.uid()`, the
+> `anon` / `authenticated` / `service_role` roles, the `auth` schema) live in your app instead.
+> Your **data** restores as-is, and the per-user **authorization** Supabase ran for you becomes a
+> little app code, often just a `where` clause you already have or one short line per query.
 
 Then do **[Part 1: Data migration](#part-1)** (all buckets), then jump to your bucket in
 **[Part 2: App rewiring](#part-2)**.
@@ -69,7 +70,7 @@ Browser / your server ────┤                                           
 ### After (this migration)
 
 ```
-Browser ─► your server ─── pg driver ──► ClickHouse-managed Postgres (public.*)   [plain tables: no PostgREST, no RLS, no auth schema]
+Browser ─► your server ─── pg driver ──► ClickHouse-managed Postgres (public.*)   [standard Postgres tables, owned by your app]
                 │
                 └── supabase-js ─► Supabase Auth   [still issues & validates the user's JWT]
 ```
